@@ -1,5 +1,4 @@
 import json
-import mimetypes
 import os
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -41,7 +40,11 @@ def build_handler(service, static_dir):
         def _error(self, exc):
             status = getattr(exc, "status", 500)
             code = getattr(exc, "code", "internal_error")
-            self._send(status, {"error": code, "message": str(exc)})
+            body = {"error": code, "message": str(exc)}
+            details = getattr(exc, "details", None)
+            if details:
+                body["details"] = details
+            self._send(status, body)
 
         def do_GET(self):
             try:
@@ -69,6 +72,18 @@ def build_handler(service, static_dir):
             except (ValueError, OSError) as exc:
                 return self._error(DomainError("invalid_request", str(exc), 400))
 
+        def _ingest_response(self, result):
+            item = service.get_item(result["item"]["id"])
+            ingest = {
+                "outcome": result["outcome"],
+                "new_zones": result.get("new_zones", []),
+                "fingerprint": result.get("fingerprint"),
+            }
+            if "report_id" in result:
+                ingest["report_id"] = result["report_id"]
+            status_code = 201 if result["outcome"] == "created" else 200
+            return self._send(status_code, {"item": item, "ingest": ingest})
+
         def do_POST(self):
             actor = role = region = None
             try:
@@ -77,7 +92,21 @@ def build_handler(service, static_dir):
                 payload = self._json_body()
                 parts = [part for part in path.split("/") if part]
                 if parts == ["api", "items"]:
-                    return self._send(201, service.create_item(payload, actor, role, region))
+                    result = service.ingest_report(payload, actor, role, region)
+                    return self._ingest_response(result)
+                if parts == ["api", "reports", "batch"]:
+                    # 监测站断网恢复后批量补传
+                    results = service.ingest_reports(payload, actor, role, region)
+                    return self._send(200, {"results": [
+                        {
+                            "item_id": result["item"]["id"],
+                            "outcome": result["outcome"],
+                            "new_zones": result.get("new_zones", []),
+                            "report_id": result.get("report_id"),
+                            "fingerprint": result.get("fingerprint"),
+                        }
+                        for result in results
+                    ]})
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":
                     return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "actions":

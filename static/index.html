@@ -1,5 +1,9 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>饮用水污染响应</title><body><h1>市政饮用水污染响应</h1><p>使用 JSON API 创建污染事件、登记水源或管网记录，并完成复检、通知、冲洗、消毒和恢复。</p><pre>GET /health
-GET /api/state
-POST /api/items
-POST /api/items/{id}/sources
-POST /api/items/{id}/actions</pre></body></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>饮用水污染响应</title><body><h1>市政饮用水污染响应</h1><p>在线监测、实验室复检、热线三渠道统一上报：同水源、同污染物、检测时间相差不到 30 分钟自动并为一条事件，原始上报与时间全部保留，重复提交不计数。处置按区域推进，新并入区域只走冲洗、消毒、复检；任一区域未完成时事件不能恢复。</p><pre>GET  /health
+GET  /api/state
+GET  /api/items/{id}                       # 含 reports（原始上报）、zone_summary、audit
+POST /api/items                            # 单条上报 channel=online_monitor|lab|hotline
+POST /api/reports/batch                    # 断网恢复后批量补传，迟到上报也计入
+POST /api/items/{id}/sources               # 来源/管网记录
+POST /api/items/{id}/actions               # verify/advise/switch_source/flush/disinfect/sample/restore/cancel
+                                           # 处置类操作需带 expected_version；版本冲突返回 409 与当前版本
+GET  /api/items/{id}/audit</pre></body></html>
