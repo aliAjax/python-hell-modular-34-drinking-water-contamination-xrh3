@@ -1,5 +1,5 @@
 from . import domain, rules
-from .domain import DomainError
+from .domain import ConflictError, DomainError
 
 
 class Service:
@@ -12,10 +12,36 @@ class Service:
         if role not in rules.CREATE_ROLES:
             raise DomainError("forbidden", "当前角色不能创建此类业务记录", 403)
         normalized = domain.normalize_create(payload)
-        stable_key = normalized.pop("_stable_key")
-        return self.repository.create_item(
-            rules.ENTITY_TYPE, stable_key, rules.INITIAL_STATUS, normalized, actor, role
+        target = self.repository.find_merge_target(
+            normalized["source_id"], normalized["contaminant"], normalized["detected_at"]
         )
+        if target is not None:
+            return self.repository.merge_report(target["id"], normalized, actor, role)
+        initial_payload = domain.build_initial_payload(normalized)
+        stable_key = "%s|%s|%s|%s|%s" % (
+            normalized["source_id"],
+            normalized["contaminant"],
+            normalized["detected_at"],
+            normalized["source_type"],
+            normalized["external_id"],
+        )
+        try:
+            return self.repository.create_item(
+                rules.ENTITY_TYPE,
+                stable_key,
+                rules.INITIAL_STATUS,
+                initial_payload,
+                actor,
+                role,
+                normalized,
+            )
+        except ConflictError:
+            target = self.repository.find_merge_target(
+                normalized["source_id"], normalized["contaminant"], normalized["detected_at"]
+            )
+            if target is None:
+                raise
+            return self.repository.merge_report(target["id"], normalized, actor, role)
 
     def add_source(self, item_id, payload, actor, role, region=None):
         if not actor or not role:
@@ -49,6 +75,11 @@ class Service:
                 raise DomainError("region_mismatch", "不能处理其他区域的记录", 403)
         if action in rules.ACTION_REQUIRES_VERSION and expected_version is None:
             raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
+        if action in rules.ACTION_REQUIRES_VERSION and int(expected_version) != int(item["version"]):
+            raise ConflictError(
+                "version_conflict",
+                "内容已被其他操作更新（当前版本 %s），请重新读取后再提交" % item["version"],
+            )
         new_status, new_payload, event_payload = rules.apply_action(item, action, payload, actor, role)
         self.repository.apply_action(
             item_id, action, actor, role, new_status, new_payload, event_payload, expected_version

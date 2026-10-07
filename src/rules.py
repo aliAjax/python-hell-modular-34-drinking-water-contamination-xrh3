@@ -48,9 +48,19 @@ def _text(payload, name):
     return value.strip()
 
 
+def _require_zone(zones, zone_id):
+    if zone_id not in zones:
+        raise DomainError("unknown_zone", "事件中不存在区域 %s" % zone_id, 404)
+
+
+def _zone_status(zones, zone_id):
+    return zones[zone_id].get("status", "pending")
+
+
 def apply_action(item, action, payload, actor, role):
     status = item["status"]
     current = dict(item["payload"])
+    zones = current.setdefault("zones", {})
 
     if action == "verify":
         _need_status(item, {"detected", "verified"})
@@ -82,8 +92,13 @@ def apply_action(item, action, payload, actor, role):
         return "switched", current, {"alternate_source_id": alternate}
 
     if action == "flush":
-        _need_status(item, {"advisory", "flushing", "switched"})
+        _need_status(item, {"advisory", "flushing", "switched", "disinfected", "sampled"})
         zone_id = _text(payload, "zone_id")
+        _require_zone(zones, zone_id)
+        if _zone_status(zones, zone_id) not in {"pending", "flushing"}:
+            raise DomainError("zone_invalid_state", "区域 %s 当前状态不允许冲洗" % zone_id, 409)
+        zones[zone_id]["status"] = "flushing"
+        zones[zone_id]["flush"] = {"actor": actor, "note": payload.get("note", "")}
         current.setdefault("response_actions", []).append({"type": "flush", "zone_id": zone_id})
         return "flushing", current, {"zone_id": zone_id, "type": "flush"}
 
@@ -92,18 +107,29 @@ def apply_action(item, action, payload, actor, role):
         if not payload.get("completed"):
             raise DomainError("disinfection_incomplete", "消毒尚未完成", 409)
         zone_id = _text(payload, "zone_id")
+        _require_zone(zones, zone_id)
+        if _zone_status(zones, zone_id) not in {"flushing", "disinfected"}:
+            raise DomainError("zone_invalid_state", "区域 %s 当前状态不允许消毒" % zone_id, 409)
+        zones[zone_id]["status"] = "disinfected"
+        zones[zone_id]["disinfect"] = {"actor": actor, "note": payload.get("note", "")}
         current.setdefault("response_actions", []).append({"type": "disinfect", "zone_id": zone_id})
         return "disinfected", current, {"zone_id": zone_id, "type": "disinfect"}
 
     if action == "sample":
         _need_status(item, {"disinfected", "sampled"})
+        zone_id = _text(payload, "zone_id")
+        _require_zone(zones, zone_id)
+        if _zone_status(zones, zone_id) not in {"disinfected", "sampled"}:
+            raise DomainError("zone_invalid_state", "区域 %s 当前状态不允许复检" % zone_id, 409)
         result = {
             "sample_id": _text(payload, "sample_id"),
-            "zone_id": _text(payload, "zone_id"),
+            "zone_id": zone_id,
             "concentration": float(payload.get("concentration", 0)),
         }
         if result["concentration"] < 0:
             raise DomainError("invalid_concentration", "浓度不能为负数")
+        zones[zone_id]["status"] = "sampled"
+        zones[zone_id]["sample"] = result
         current.setdefault("sample_results", []).append(result)
         return "sampled", current, {"sample_result": result}
 
@@ -111,6 +137,13 @@ def apply_action(item, action, payload, actor, role):
         _need_status(item, {"sampled"})
         if not payload.get("all_zones_cleared"):
             raise DomainError("zones_not_cleared", "仍有区域未完成水质恢复", 409)
+        pending = [zone_id for zone_id, state in zones.items() if state.get("status") != "sampled"]
+        if pending:
+            raise DomainError(
+                "zones_not_cleared",
+                "仍有区域未完成水质恢复: %s" % "、".join(pending),
+                409,
+            )
         limit = float(current.get("limit", 0))
         results = current.get("sample_results", [])
         if not results or any(float(result["concentration"]) > limit for result in results):

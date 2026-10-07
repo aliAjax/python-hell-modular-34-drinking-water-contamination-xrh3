@@ -2,6 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
+from . import domain
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
 
@@ -70,6 +71,19 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    source_id TEXT NOT NULL,
+                    contaminant TEXT NOT NULL,
+                    detected_at TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(source_id, contaminant, source_type, external_id),
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
                 """
             )
         finally:
@@ -105,7 +119,7 @@ class Repository:
             (item_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
         )
 
-    def create_item(self, entity_type, stable_key, initial_status, payload, actor, role):
+    def create_item(self, entity_type, stable_key, initial_status, payload, actor, role, report):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -127,9 +141,133 @@ class Repository:
             except sqlite3.IntegrityError:
                 raise ConflictError("duplicate_item", "同一业务实体已经存在")
             item_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            report_id = self._insert_report(conn, item_id, report)
+            payload["reports"] = [domain.report_summary(report, report_id)]
+            conn.execute(
+                "UPDATE items SET payload=? WHERE id=?",
+                (canonical_json(payload), item_id),
+            )
             self.append_audit(conn, item_id, "created", actor, role, {"stable_key": stable_key})
+            self.append_audit(
+                conn,
+                item_id,
+                "report_recorded",
+                actor,
+                role,
+                {"report_id": report_id, "source_type": report["source_type"], "external_id": report["external_id"]},
+            )
             conn.execute("COMMIT")
             return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def _insert_report(self, conn, item_id, report):
+        report_payload = {
+            "source_id": report["source_id"],
+            "contaminant": report["contaminant"],
+            "detected_at": report["detected_at"],
+            "concentration": report["concentration"],
+            "limit": report["limit"],
+            "zone_ids": list(report["zone_ids"]),
+            "population": report["population"],
+            "complaints": report["complaints"],
+            "source_type": report["source_type"],
+            "external_id": report["external_id"],
+        }
+        conn.execute(
+            "INSERT INTO reports(item_id,source_id,contaminant,detected_at,source_type,external_id,payload,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                item_id,
+                report["source_id"],
+                report["contaminant"],
+                report["detected_at"],
+                report["source_type"],
+                report["external_id"],
+                canonical_json(report_payload),
+                now_iso(),
+            ),
+        )
+        return conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+    def find_merge_target(self, source_id, contaminant, detected_at):
+        conn = self.connect()
+        try:
+            target_dt = datetime.fromisoformat(detected_at.replace("Z", "+00:00"))
+            rows = conn.execute(
+                "SELECT item_id, detected_at FROM reports WHERE source_id=? AND contaminant=?",
+                (source_id, contaminant),
+            ).fetchall()
+            best_item_id = None
+            best_diff = None
+            for row in rows:
+                report_dt = datetime.fromisoformat(row["detected_at"].replace("Z", "+00:00"))
+                diff = abs((target_dt - report_dt).total_seconds())
+                if diff < 1800 and (best_diff is None or diff < best_diff):
+                    best_item_id = row["item_id"]
+                    best_diff = diff
+            if best_item_id is None:
+                return None
+            item = conn.execute("SELECT * FROM items WHERE id=?", (best_item_id,)).fetchone()
+            if item is None or item["status"] == "cancelled":
+                return None
+            return self._row_to_item(item)
+        finally:
+            conn.close()
+
+    def merge_report(self, item_id, report, actor, role):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            if row["status"] == "cancelled":
+                raise ConflictError("item_cancelled", "事件已取消，不能并入上报")
+            existing = conn.execute(
+                "SELECT id FROM reports WHERE source_id=? AND contaminant=? AND source_type=? AND external_id=?",
+                (report["source_id"], report["contaminant"], report["source_type"], report["external_id"]),
+            ).fetchone()
+            if existing:
+                conn.execute("COMMIT")
+                result = self._row_to_item(row)
+                result["_duplicate"] = True
+                return result
+            report_id = self._insert_report(conn, item_id, report)
+            payload = json.loads(row["payload"])
+            new_zones = domain.merge_zones(payload, report["zone_ids"])
+            payload.setdefault("reports", []).append(domain.report_summary(report, report_id))
+            new_status = row["status"]
+            if new_zones and new_status in {"disinfected", "sampled", "restored"}:
+                new_status = "flushing"
+            conn.execute(
+                "UPDATE items SET status=?,version=version+1,payload=?,updated_at=? WHERE id=?",
+                (new_status, canonical_json(payload), now_iso(), item_id),
+            )
+            self.append_audit(
+                conn,
+                item_id,
+                "report_merged",
+                actor,
+                role,
+                {
+                    "report_id": report_id,
+                    "source_type": report["source_type"],
+                    "external_id": report["external_id"],
+                    "new_zones": new_zones,
+                },
+            )
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            conn.execute("COMMIT")
+            result = self._row_to_item(row)
+            result["_merged"] = True
+            result["_new_zones"] = new_zones
+            return result
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -215,7 +353,10 @@ class Repository:
             if row is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
             if expected_version is not None and int(expected_version) != int(row["version"]):
-                raise ConflictError("version_conflict", "记录已被其他操作更新，请重新读取")
+                raise ConflictError(
+                    "version_conflict",
+                    "内容已被其他操作更新（当前版本 %s），请重新读取后再提交" % row["version"],
+                )
             version = int(row["version"]) + 1
             conn.execute(
                 "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",

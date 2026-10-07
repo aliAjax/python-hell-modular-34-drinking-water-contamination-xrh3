@@ -33,8 +33,9 @@ class FailureTest(unittest.TestCase):
 
     def test_duplicate_and_notification_dedup(self):
         item = self.service.create_item(self.payload, "a", "analyst")
-        with self.assertRaises(ConflictError):
-            self.service.create_item(self.payload, "a", "analyst")
+        again = self.service.create_item(self.payload, "a", "analyst")
+        self.assertEqual(again["id"], item["id"])
+        self.assertEqual(again["payload"]["reports"], item["payload"]["reports"])
         item = self.service.act(item["id"], "verify", {"sample_count": 1}, "a", "analyst", item["version"])
         item = self.service.act(item["id"], "advise", {"notice_id": "N-2", "kind": "boil", "message": "煮沸"}, "d", "dispatcher", item["version"])
         with self.assertRaises(DomainError) as context:

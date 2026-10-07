@@ -77,7 +77,14 @@ def build_handler(service, static_dir):
                 payload = self._json_body()
                 parts = [part for part in path.split("/") if part]
                 if parts == ["api", "items"]:
-                    return self._send(201, service.create_item(payload, actor, role, region))
+                    result = service.create_item(payload, actor, role, region)
+                    merged = result.pop("_merged", False)
+                    duplicate = result.pop("_duplicate", False)
+                    result.pop("_new_zones", None)
+                    result["merged"] = bool(merged)
+                    result["duplicate"] = bool(duplicate)
+                    status = 200 if (merged or duplicate) else 201
+                    return self._send(status, result)
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":
                     return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "actions":
